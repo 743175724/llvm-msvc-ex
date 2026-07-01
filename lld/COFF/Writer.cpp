@@ -23,6 +23,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/BinaryFormat/COFF.h"
+#include "llvm/Support/BLAKE3.h"
 #include "llvm/Support/BinaryStreamReader.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/Endian.h"
@@ -31,12 +32,15 @@
 #include "llvm/Support/Path.h"
 #include "llvm/Support/RandomNumberGenerator.h"
 #include "llvm/Support/TimeProfiler.h"
-#include "llvm/Support/xxhash.h"
 #include <algorithm>
 #include <cstdio>
 #include <map>
 #include <memory>
 #include <utility>
+#if defined(__unix__) || defined(__APPLE__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 using namespace llvm;
 using namespace llvm::COFF;
@@ -45,6 +49,7 @@ using namespace llvm::support;
 using namespace llvm::support::endian;
 using namespace lld;
 using namespace lld::coff;
+
 
 /* To re-generate DOSProgram:
 $ cat > /tmp/DOSProgram.asm
@@ -66,18 +71,44 @@ align 8, db 0
 $ nasm -fbin /tmp/DOSProgram.asm -o /tmp/DOSProgram.bin
 $ xxd -i /tmp/DOSProgram.bin
 */
+
+static unsigned char dosProgram_rich[] = {
+  0x0e, 0x1f, 0xba, 0x0e, 0x00, 0xb4, 0x09, 0xcd, 0x21, 0xb8, 0x01, 0x4c,
+  0xcd, 0x21, 0x54, 0x68, 0x69, 0x73, 0x20, 0x70, 0x72, 0x6f, 0x67, 0x72,
+  0x61, 0x6d, 0x20, 0x63, 0x61, 0x6e, 0x6e, 0x6f, 0x74, 0x20, 0x62, 0x65,
+  0x20, 0x72, 0x75, 0x6e, 0x20, 0x69, 0x6e, 0x20, 0x44, 0x4f, 0x53, 0x20,
+  0x6d, 0x6f, 0x64, 0x65, 0x2e, 0x0d, 0x0d, 0x0a, 0x24, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x37, 0xA7, 0xBA, 0x33, 0x73, 0xC6, 0xD4, 0x60,
+  0x73, 0xC6, 0xD4, 0x60, 0x73, 0xC6, 0xD4, 0x60, 0x73, 0xC6, 0xD4, 0x60,
+  0x71, 0xC6, 0xD4, 0x60, 0x07, 0x47, 0xD4, 0x61, 0x72, 0xC6, 0xD4, 0x60, 
+  0x07, 0x47, 0xD7, 0x61, 0x5C, 0xC6, 0xD4, 0x60, 0x07, 0x47, 0xD0, 0x61, 
+  0x0C, 0xC6, 0xD4, 0x60, 0x07, 0x47, 0xDC, 0x61, 0x3A, 0xC7, 0xD4, 0x60, 
+  0x07, 0x47, 0xD1, 0x61, 0x6D, 0xC6, 0xD4, 0x60, 0x07, 0x47, 0x2B, 0x60,
+  0x72, 0xC6, 0xD4, 0x60, 0x07, 0x47, 0xD6, 0x61, 0x72, 0xC6, 0xD4, 0x60, 
+  0x52, 0x69, 0x63, 0x68, 0x73, 0xC6, 0xD4, 0x60, 0x00, 0x00, 0x00, 0x00, 
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+};
+
+static_assert(sizeof(dosProgram_rich) % 8 == 0,
+              "DOSProgram size must be multiple of 8");
+
 static unsigned char dosProgram[] = {
   0x0e, 0x1f, 0xba, 0x0e, 0x00, 0xb4, 0x09, 0xcd, 0x21, 0xb8, 0x01, 0x4c,
   0xcd, 0x21, 0x54, 0x68, 0x69, 0x73, 0x20, 0x70, 0x72, 0x6f, 0x67, 0x72,
   0x61, 0x6d, 0x20, 0x63, 0x61, 0x6e, 0x6e, 0x6f, 0x74, 0x20, 0x62, 0x65,
   0x20, 0x72, 0x75, 0x6e, 0x20, 0x69, 0x6e, 0x20, 0x44, 0x4f, 0x53, 0x20,
-  0x6d, 0x6f, 0x64, 0x65, 0x2e, 0x24, 0x00, 0x00
+  0x6d, 0x6f, 0x64, 0x65, 0x2e, 0x0d, 0x0d, 0x0a
 };
+
 static_assert(sizeof(dosProgram) % 8 == 0,
               "DOSProgram size must be multiple of 8");
 
 static const int dosStubSize = sizeof(dos_header) + sizeof(dosProgram);
 static_assert(dosStubSize % 8 == 0, "DOSStub size must be multiple of 8");
+
+static const int dosStubSize_rich = sizeof(dos_header) + sizeof(dosProgram_rich);
+static_assert(dosStubSize_rich % 8 == 0, "DOSStub size must be multiple of 8");
+
 
 static const int numberOfDataDirectory = 16;
 
@@ -110,7 +141,7 @@ public:
       // "the timestamp field is really a hash", or a 4-byte size field
       // followed by that many bytes containing a longer hash (with the
       // lowest 4 bytes usually being the timestamp in little-endian order).
-      // Consider storing the full 8 bytes computed by xxh3_64bits here.
+      // Consider storing the full 8 bytes computed by the build-id hash here.
       fillEntry(d, COFF::IMAGE_DEBUG_TYPE_REPRO, 0, 0, 0);
     }
   }
@@ -709,7 +740,7 @@ void Writer::writePEChecksum() {
   uint32_t size = (uint32_t)(buffer->getBufferSize());
 
   coff_file_header *coffHeader =
-      (coff_file_header *)((uint8_t *)buf + dosStubSize + sizeof(PEMagic));
+      (coff_file_header *)((uint8_t *)buf + (ctx.config.useRich ? dosStubSize_rich : dosStubSize) + sizeof(PEMagic));
   pe32_header *peHeader =
       (pe32_header *)((uint8_t *)coffHeader + sizeof(coff_file_header));
   uint32_t oldCheckSum = peHeader->CheckSum;
@@ -1225,6 +1256,8 @@ void Writer::createImportTables() {
   for (ImportFile *file : ctx.importFileInstances) {
     if (!file->live)
       continue;
+    if (!file->impSym)
+      continue;
 
     std::string dll = StringRef(file->dllName).lower();
     if (ctx.config.dllOrder.count(dll) == 0)
@@ -1245,7 +1278,7 @@ void Writer::createImportTables() {
 }
 
 void Writer::appendImportThunks() {
-  if (ctx.importFileInstances.empty())
+  if (ctx.importFileInstances.empty() && ctx.symtab.extraImportThunkChunks.empty())
     return;
 
   llvm::TimeTraceScope timeScope("Import thunks");
@@ -1262,6 +1295,10 @@ void Writer::appendImportThunks() {
     if (file->thunkLive)
       textSec->addChunk(thunk->getChunk());
   }
+
+  // Add synthetic thunks created to jump via existing __imp_<name> symbols.
+  for (Chunk *c : ctx.symtab.extraImportThunkChunks)
+    textSec->addChunk(c);
 
   if (!delayIdata.empty()) {
     Defined *helper = cast<Defined>(ctx.config.delayLoadHelper);
@@ -1558,7 +1595,7 @@ void Writer::assignAddresses() {
   // We do it here to make sure that we account for range extension chunks.
   createECCodeMap();
 
-  sizeOfHeaders = dosStubSize + sizeof(PEMagic) + sizeof(coff_file_header) +
+  sizeOfHeaders = (ctx.config.useRich ? dosStubSize_rich : dosStubSize) + sizeof(PEMagic) + sizeof(coff_file_header) +
                   sizeof(data_directory) * numberOfDataDirectory +
                   sizeof(coff_section) * ctx.outputSections.size();
   sizeOfHeaders +=
@@ -1627,17 +1664,17 @@ template <typename PEHeaderTy> void Writer::writeHeader() {
   buf += sizeof(dos_header);
   dos->Magic[0] = 'M';
   dos->Magic[1] = 'Z';
-  dos->UsedBytesInTheLastPage = dosStubSize % 512;
+  dos->UsedBytesInTheLastPage = (ctx.config.useRich ? dosStubSize_rich : dosStubSize) % 512;
   dos->FileSizeInPages = 3;
   dos->HeaderSizeInParagraphs = sizeof(dos_header) / 16;
   dos->MaximumExtraParagraphs = 0xFFFF;
   dos->InitialSP = 0xB8;
   dos->AddressOfRelocationTable = sizeof(dos_header);
-  dos->AddressOfNewExeHeader = dosStubSize;
+  dos->AddressOfNewExeHeader = ctx.config.useRich ? dosStubSize_rich : dosStubSize;
 
   // Write DOS program.
-  memcpy(buf, dosProgram, sizeof(dosProgram));
-  buf += sizeof(dosProgram);
+  memcpy(buf, ctx.config.useRich ? dosProgram_rich : dosProgram, (ctx.config.useRich ? dosStubSize_rich : dosStubSize) - sizeof(dos_header));
+  buf += (ctx.config.useRich ? dosStubSize_rich : dosStubSize) - sizeof(dos_header);
 
   // Write PE magic
   memcpy(buf, PEMagic, sizeof(PEMagic));
@@ -2231,19 +2268,80 @@ void Writer::writeSections() {
     // merged into a code section don't.
     if ((sec->header.Characteristics & IMAGE_SCN_CNT_CODE) &&
         (ctx.config.machine == AMD64 || ctx.config.machine == I386)) {
+      SmallVector<std::pair<uint32_t, uint32_t>, 0> gaps;
+      gaps.reserve(sec->chunks.size() + 1);
       uint32_t prevEnd = 0;
       for (Chunk *c : sec->chunks) {
         uint32_t off = c->getRVA() - sec->getRVA();
-        memset(secBuf + prevEnd, 0xCC, off - prevEnd);
+        if (off > prevEnd)
+          gaps.emplace_back(prevEnd, off);
         prevEnd = off + c->getSize();
       }
-      memset(secBuf + prevEnd, 0xCC, sec->getRawSize() - prevEnd);
+      if (sec->getRawSize() > prevEnd)
+        gaps.emplace_back(prevEnd, sec->getRawSize());
+
+      auto fillGap = [&](const std::pair<uint32_t, uint32_t> &gap) {
+        memset(secBuf + gap.first, 0xCC, gap.second - gap.first);
+      };
+      static constexpr size_t kParallelInt3FillThreshold = 2048;
+      if (parallel::strategy.ThreadsRequested != 1 &&
+          gaps.size() >= kParallelInt3FillThreshold)
+        parallelForEach(gaps, fillGap);
+      else
+        for (const auto &gap : gaps)
+          fillGap(gap);
     }
 
     parallelForEach(sec->chunks, [&](Chunk *c) {
       c->writeTo(secBuf + c->getRVA() - sec->getRVA());
     });
   }
+}
+
+static void markChunkAsDontNeed(ArrayRef<uint8_t> arr) {
+#if defined(MADV_DONTNEED) && (defined(__unix__) || defined(__APPLE__))
+  if (arr.empty())
+    return;
+  static size_t pageSize = [] {
+    long p = ::sysconf(_SC_PAGESIZE);
+    return p > 0 ? static_cast<size_t>(p) : size_t(0);
+  }();
+  if (!pageSize)
+    return;
+
+  uintptr_t begin = reinterpret_cast<uintptr_t>(arr.data());
+  uintptr_t end = begin + arr.size();
+  uintptr_t alignedBegin = ((begin + pageSize - 1) / pageSize) * pageSize;
+  uintptr_t alignedEnd = (end / pageSize) * pageSize;
+  if (alignedBegin >= alignedEnd)
+    return;
+  (void)::madvise(reinterpret_cast<void *>(alignedBegin), alignedEnd - alignedBegin,
+                  MADV_DONTNEED);
+#else
+  (void)arr;
+#endif
+}
+
+static uint64_t computeChunkedBLAKE3Hash64(ArrayRef<uint8_t> data) {
+  constexpr size_t chunkSize = 1024 * 1024;
+  if (data.empty())
+    return read64le(BLAKE3::hash<8>(ArrayRef<uint8_t>()).data());
+
+  size_t numChunks = (data.size() + chunkSize - 1) / chunkSize;
+  std::unique_ptr<uint8_t[]> chunkHashes(new uint8_t[numChunks * 8]);
+
+  parallelFor(0, numChunks, [&](size_t i) {
+    size_t begin = i * chunkSize;
+    size_t end = std::min(begin + chunkSize, data.size());
+    ArrayRef<uint8_t> chunk = data.slice(begin, end - begin);
+    auto digest = BLAKE3::hash<8>(chunk);
+    memcpy(chunkHashes.get() + i * 8, digest.data(), 8);
+    markChunkAsDontNeed(chunk);
+  });
+
+  auto digest =
+      BLAKE3::hash<8>(ArrayRef<uint8_t>(chunkHashes.get(), numChunks * 8));
+  return read64le(digest.data());
 }
 
 void Writer::writeBuildId() {
@@ -2266,15 +2364,14 @@ void Writer::writeBuildId() {
   // "timestamp" in the COFF file header, and the ones in the coff debug
   // directory.  Now we can hash the file and write that hash to the various
   // timestamp fields in the file.
-  StringRef outputFileData(
-      reinterpret_cast<const char *>(buffer->getBufferStart()),
-      buffer->getBufferSize());
+  ArrayRef<uint8_t> outputFileData(buffer->getBufferStart(),
+                                   buffer->getBufferSize());
 
   uint32_t timestamp = config->timestamp;
   uint64_t hash = 0;
 
   if (config->repro || generateSyntheticBuildId)
-    hash = xxh3_64bits(outputFileData);
+    hash = computeChunkedBLAKE3Hash64(outputFileData);
 
   if (config->repro)
     timestamp = static_cast<uint32_t>(hash);
@@ -2283,16 +2380,16 @@ void Writer::writeBuildId() {
     buildId->buildId->PDB70.CVSignature = OMF::Signature::PDB70;
     buildId->buildId->PDB70.Age = 1;
     memcpy(buildId->buildId->PDB70.Signature, &hash, 8);
-    // xxhash only gives us 8 bytes, so put some fixed data in the other half.
+    // Timestamp uses 64-bit hash data; keep a fixed payload in the other half.
     // Change PDB signature.
-    memset(&buildId->buildId->PDB70.Signature[8], 0, 8);
+    memcpy(&buildId->buildId->PDB70.Signature[8], "LLD PDB.", 8);
   }
 
   if (debugDirectory)
     debugDirectory->setTimeDateStamp(timestamp);
 
   uint8_t *buf = buffer->getBufferStart();
-  buf += dosStubSize + sizeof(PEMagic);
+  buf += (ctx.config.useRich ? dosStubSize_rich : dosStubSize) + sizeof(PEMagic);
   object::coff_file_header *coffHeader =
       reinterpret_cast<coff_file_header *>(buf);
   coffHeader->TimeDateStamp = timestamp;

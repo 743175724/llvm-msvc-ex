@@ -116,6 +116,11 @@ if(LLD_VENDOR)
   add_definitions(-DLLD_VENDOR="${LLD_VENDOR}")
 endif()
 
+# option(FAKE_RICH_HEADER "Enable fake rich header" OFF)
+# if(FAKE_RICH_HEADER)
+#     add_definitions(-DFAKE_RICH_HEADER)
+# endif()
+
 # Compute the LLD version from the LLVM version.
 string(REGEX MATCH "[0-9]+\\.[0-9]+(\\.[0-9]+)?" LLD_VERSION
   ${PACKAGE_VERSION})
@@ -163,6 +168,12 @@ endif()
 option(LLD_BUILD_TOOLS
   "Build the lld tools. If OFF, just generate build targets." ON)
 
+option(LLD_ENABLE_MIMALLOC
+  "Link lld driver with mimalloc (or mimalloc-override) for allocator experiments."
+  OFF)
+set(LLD_MIMALLOC_LIBRARY "" CACHE FILEPATH
+  "Path to mimalloc library used when LLD_ENABLE_MIMALLOC is ON.")
+  
 option(LLD_DEFAULT_LD_LLD_IS_MINGW
     "Use MinGW as the default backend for ld.lld. If OFF, ELF will be used." OFF)
 if (LLD_DEFAULT_LD_LLD_IS_MINGW)
